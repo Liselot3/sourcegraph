@@ -1017,31 +1017,96 @@ func fetchJobs(ctx context.Context, client *bk.Client, buildNumber int, pending 
 			return false, errors.Newf("failed to get most recent build for branch %q: %w", *build.Branch, err)
 		}
 
-		// Check if all jobs are finished
-		finishedJobs := 0
-		for _, job := range build.Jobs {
-			if job.State != nil {
-				if *job.State == "failed" && !job.SoftFailed {
-					// If a job has failed, return immediately, we don't have to wait until all
-					// steps are completed.
-					return true, nil
-				}
-				if *job.State == "passed" || job.SoftFailed {
-					finishedJobs++
-				}
-			}
-		}
+	return failedJob, logs, nil
+}
 
-		// once started, poll for status
-		if build.StartedAt != nil {
-			pending.Updatef("Waiting for %d out of %d jobs... (elapsed: %v)",
-				len(build.Jobs)-finishedJobs, len(build.Jobs), time.Since(build.StartedAt.Time))
-		}
-
-		if build.FinishedAt == nil {
-			// No failure yet, we can keep waiting.
-			return false, nil
-		}
-		return true, nil
+func askCody(cmd *cli.Context) error {
+	std.Out.WriteNoticef("Fetching log of the first job failure on build %d", cmd.Int("build"))
+	job, logs, err := getFailedJobLogs(cmd)
+	if err != nil {
+		return errors.Newf("failed to get failed job logs for build %s", cmd.Int("build"))
 	}
+
+	ciRefContent, err := os.ReadFile("./doc/dev/background-information/ci/reference.md")
+	if err != nil {
+		return errors.Newf("failed to read ci reference.md: %v", err)
+	}
+	bazelDocs, err := os.ReadFile("./doc/dev/background-information/bazel.md")
+	if err != nil {
+		return errors.Newf("failed to read ci bazel.md: %v", err)
+	}
+	bazelClientDocs, err := os.ReadFile("./doc/dev/background-information/bazel_web.md")
+	if err != nil {
+		return errors.Newf("failed to read ci bazel_web.md: %v", err)
+	}
+
+	srcURL := os.Getenv("SRC_URL")
+	srcToken := os.Getenv("SRC_TOKEN")
+	cli := claude.NewClient(srcURL, srcToken, nil)
+	messages := []claude.Message{
+		{
+			Speaker: "ASSISTANT",
+			Text: `I am Cody, an AI-powered coding assistant developed by Sourcegraph. I operate inside the Sourcegraph repository. My task is to help programmers with debugging tasks. I specialize in diagnosing CI failures.
+I have access to all files present in your Sourcegraph repository.
+I am able to suggest code changes and commands to run.
+I will generate suggestions as concisely and clearly as possible.
+I only suggest something if I am certain about my answer.`,
+		},
+		{
+			Speaker: "HUMAN",
+			Text:    fmt.Sprintf(`Here is some extra information about our CI Pipeline. Reference this information when you diagnose any problems I send to you about steps failing on the CI Pipeline: %s`, ciRefContent),
+		},
+		{
+			Speaker: claude.Assistant,
+			Text:    "Ok.",
+		},
+		{
+			Speaker: "HUMAN",
+			Text:    fmt.Sprintf(`Here is some extra information about Bazel. Reference this information when you diagnose any problems I send to you about things failing with Bazel: %s`, bazelDocs),
+		},
+		{
+			Speaker: claude.Assistant,
+			Text:    "Ok.",
+		},
+		{
+			Speaker: "HUMAN",
+			Text:    fmt.Sprintf(`Here is some extra information about our Client code using Bazel. Reference this information when you diagnose any problems I send to you about things failing with Bazel: %s`, bazelClientDocs),
+		},
+		{
+			Speaker: claude.Assistant,
+			Text:    "Ok.",
+		},
+		{
+			Speaker: "HUMAN",
+			Text:    fmt.Sprintf(`"Here is the failed job log output for step %s: %s`, *job.Name, logs),
+		},
+		{
+			Speaker: claude.Assistant,
+			Text:    "Ok.",
+		},
+		{
+			Speaker: "HUMAN",
+			Text:    `When suggesting fixes please use bazel commands equivalent if they exist, and if more debugging is needed they should reach out to @dev-experience-support. Show my why the build failed and suggest fixes I should attempt. If tests failed, show me which tests I should rerun and how`,
+		},
+		{
+			Speaker: "ASSISTANT",
+			Text:    "```markdown",
+		},
+	}
+
+	params := claude.DefaultCompletionParameters(messages)
+
+	start := time.Now()
+	std.Out.WriteNoticef("Asking Cody 🤖 why %s failed...", *job.Name)
+	resChan, _ := cli.StreamCompletion(context.Background(), params, true)
+	result := ""
+	for res := range resChan {
+		result = res
+	}
+	block := std.Out.Block(output.Styledf(output.StyleSuggestion, "Answer from Cody"))
+	block.WriteMarkdown(result, output.MarkdownNoMargin, output.MarkdownIndent(2))
+	block.Close()
+	fmt.Println(time.Since(start))
+
+	return nil
 }
